@@ -28,7 +28,7 @@ func TestOffCurve(t *testing.T) {
 	b := Marshal(p224, x, y)
 	x1, y1 := Unmarshal(p224, b)
 	if x1 != nil || y1 != nil {
-		t.Errorf("FAIL: unmarshalling a point not on the curve succeeded")
+		t.Errorf("FAIL: unmarshaling a point not on the curve succeeded")
 	}
 }
 
@@ -438,6 +438,18 @@ func BenchmarkBaseMultP256(b *testing.B) {
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
 		p256.ScalarBaseMult(k.Bytes())
+	}
+}
+
+func BenchmarkScalarMultP256(b *testing.B) {
+	b.ResetTimer()
+	p256 := P256()
+	_, x, y, _ := GenerateKey(p256, rand.Reader)
+	priv, _, _, _ := GenerateKey(p256, rand.Reader)
+
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		p256.ScalarMult(x, y, priv)
 	}
 }
 

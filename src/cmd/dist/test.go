@@ -1,4 +1,4 @@
-// Copyright 2015 The Go Authors.  All rights reserved.
+// Copyright 2015 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -16,34 +17,44 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 func cmdtest() {
 	var t tester
+	var noRebuild bool
 	flag.BoolVar(&t.listMode, "list", false, "list available tests")
-	flag.BoolVar(&t.noRebuild, "no-rebuild", false, "don't rebuild std and cmd packages")
+	flag.BoolVar(&t.rebuild, "rebuild", false, "rebuild everything first")
+	flag.BoolVar(&noRebuild, "no-rebuild", false, "overrides -rebuild (historical dreg)")
 	flag.BoolVar(&t.keepGoing, "k", false, "keep going even when error occurred")
 	flag.BoolVar(&t.race, "race", false, "run in race builder mode (different set of tests)")
+	flag.BoolVar(&t.compileOnly, "compile-only", false, "compile tests, but don't run them. This is for some builders. Not all dist tests respect this flag, but most do.")
 	flag.StringVar(&t.banner, "banner", "##### ", "banner prefix; blank means no section banners")
 	flag.StringVar(&t.runRxStr, "run", os.Getenv("GOTESTONLY"),
 		"run only those tests matching the regular expression; empty means to run all. "+
 			"Special exception: if the string begins with '!', the match is inverted.")
 	xflagparse(-1) // any number of args
+	if noRebuild {
+		t.rebuild = false
+	}
 	t.run()
 }
 
 // tester executes cmdtest.
 type tester struct {
-	race      bool
-	listMode  bool
-	noRebuild bool
-	keepGoing bool
-	runRxStr  string
-	runRx     *regexp.Regexp
-	runRxWant bool     // want runRx to match (true) or not match (false)
-	runNames  []string // tests to run, exclusive with runRx; empty means all
-	banner    string   // prefix, or "" for none
+	race        bool
+	listMode    bool
+	rebuild     bool
+	failed      bool
+	keepGoing   bool
+	compileOnly bool // just try to compile all tests, but no need to run
+	runRxStr    string
+	runRx       *regexp.Regexp
+	runRxWant   bool     // want runRx to match (true) or not match (false)
+	runNames    []string // tests to run, exclusive with runRx; empty means all
+	banner      string   // prefix, or "" for none
+	lastHeading string   // last dir heading printed
 
 	goroot     string
 	goarch     string
@@ -56,6 +67,17 @@ type tester struct {
 
 	tests        []distTest
 	timeoutScale int
+
+	worklist []*work
+}
+
+type work struct {
+	dt    *distTest
+	cmd   *exec.Cmd
+	start chan bool
+	out   []byte
+	err   error
+	end   chan bool
 }
 
 // A distTest is a test run by dist test.
@@ -63,7 +85,7 @@ type tester struct {
 type distTest struct {
 	name    string // unique test name; may be filtered with -run flag
 	heading string // group section; this header is printed before the test is run.
-	fn      func() error
+	fn      func(*distTest) error
 }
 
 func mustEnv(k string) string {
@@ -96,7 +118,7 @@ func (t *tester) run() {
 		}
 	}
 
-	if !t.noRebuild {
+	if t.rebuild {
 		t.out("Building packages and commands.")
 		cmd := exec.Command("go", "install", "-a", "-v", "std", "cmd")
 		cmd.Stdout = os.Stdout
@@ -130,8 +152,11 @@ func (t *tester) run() {
 	}
 
 	t.timeoutScale = 1
-	if t.goarch == "arm" || t.goos == "windows" {
+	switch t.goarch {
+	case "arm":
 		t.timeoutScale = 2
+	case "mips", "mipsle", "mips64", "mips64le":
+		t.timeoutScale = 4
 	}
 	if s := os.Getenv("GO_TEST_TIMEOUT_SCALE"); s != "" {
 		t.timeoutScale, err = strconv.Atoi(s)
@@ -169,22 +194,15 @@ func (t *tester) run() {
 		}
 	}
 
-	var lastHeading string
-	ok := true
 	for _, dt := range t.tests {
 		if !t.shouldRunTest(dt.name) {
 			t.partial = true
 			continue
 		}
-		if dt.heading != "" && lastHeading != dt.heading {
-			lastHeading = dt.heading
-			t.out(dt.heading)
-		}
-		if vflag > 0 {
-			fmt.Printf("# go tool dist test -run=^%s$\n", dt.name)
-		}
-		if err := dt.fn(); err != nil {
-			ok = false
+		dt := dt // dt used in background after this iteration
+		if err := dt.fn(&dt); err != nil {
+			t.runPending(&dt) // in case that hasn't been done yet
+			t.failed = true
 			if t.keepGoing {
 				log.Printf("Failed: %v", err)
 			} else {
@@ -192,7 +210,8 @@ func (t *tester) run() {
 			}
 		}
 	}
-	if !ok {
+	t.runPending(nil)
+	if t.failed {
 		fmt.Println("\nFAILED")
 		os.Exit(1)
 	} else if t.partial {
@@ -250,10 +269,11 @@ func (t *tester) registerStdTest(pkg string) {
 	t.tests = append(t.tests, distTest{
 		name:    testName,
 		heading: "Testing packages.",
-		fn: func() error {
+		fn: func(dt *distTest) error {
 			if ranGoTest {
 				return nil
 			}
+			t.runPending(dt)
 			ranGoTest = true
 			args := []string{
 				"test",
@@ -264,6 +284,9 @@ func (t *tester) registerStdTest(pkg string) {
 			}
 			if t.race {
 				args = append(args, "-race")
+			}
+			if t.compileOnly {
+				args = append(args, "-run=^$")
 			}
 			args = append(args, stdMatches...)
 			cmd := exec.Command("go", args...)
@@ -282,19 +305,22 @@ func (t *tester) registerRaceBenchTest(pkg string) {
 	t.tests = append(t.tests, distTest{
 		name:    testName,
 		heading: "Running benchmarks briefly.",
-		fn: func() error {
+		fn: func(dt *distTest) error {
 			if ranGoBench {
 				return nil
 			}
+			t.runPending(dt)
 			ranGoBench = true
 			args := []string{
 				"test",
 				"-short",
 				"-race",
 				"-run=^$", // nothing. only benchmarks.
-				"-bench=.*",
 				"-benchtime=.1s",
 				"-cpu=4",
+			}
+			if !t.compileOnly {
+				args = append(args, "-bench=.*")
 			}
 			args = append(args, benchMatches...)
 			cmd := exec.Command("go", args...)
@@ -305,7 +331,47 @@ func (t *tester) registerRaceBenchTest(pkg string) {
 	})
 }
 
+// stdOutErrAreTerminals is defined in test_linux.go, to report
+// whether stdout & stderr are terminals.
+var stdOutErrAreTerminals func() bool
+
 func (t *tester) registerTests() {
+	if strings.HasSuffix(os.Getenv("GO_BUILDER_NAME"), "-vetall") {
+		// Run vet over std and cmd and call it quits.
+		t.tests = append(t.tests, distTest{
+			name:    "vet/all",
+			heading: "go vet std cmd",
+			fn: func(dt *distTest) error {
+				// This runs vet/all for the current platform.
+				// TODO: on a fast builder or builders, run over all platforms.
+				t.addCmd(dt, "src/cmd/vet/all", "go", "run", "main.go", "-all")
+				return nil
+			},
+		})
+		return
+	}
+
+	// This test needs its stdout/stderr to be terminals, so we don't run it from cmd/go's tests.
+	// See issue 18153.
+	if t.goos == "linux" {
+		t.tests = append(t.tests, distTest{
+			name:    "cmd_go_test_terminal",
+			heading: "cmd/go terminal test",
+			fn: func(dt *distTest) error {
+				t.runPending(dt)
+				if !stdOutErrAreTerminals() {
+					fmt.Println("skipping terminal test; stdout/stderr not terminals")
+					return nil
+				}
+				cmd := exec.Command("go", "test")
+				cmd.Dir = filepath.Join(os.Getenv("GOROOT"), "src/cmd/go/testdata/testterminal18153")
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				return cmd.Run()
+			},
+		})
+	}
+
 	// Fast path to avoid the ~1 second of `go list std cmd` when
 	// the caller lists specific tests to run. (as the continuous
 	// build coordinator does).
@@ -321,11 +387,15 @@ func (t *tester) registerTests() {
 	} else {
 		// Use a format string to only list packages and commands that have tests.
 		const format = "{{if (or .TestGoFiles .XTestGoFiles)}}{{.ImportPath}}{{end}}"
-		cmd := exec.Command("go", "list", "-f", format, "std")
+		cmd := exec.Command("go", "list", "-f", format)
+		if t.race {
+			cmd.Args = append(cmd.Args, "-tags", "race")
+		}
+		cmd.Args = append(cmd.Args, "std")
 		if !t.race {
 			cmd.Args = append(cmd.Args, "cmd")
 		}
-		all, err := cmd.CombinedOutput()
+		all, err := cmd.Output()
 		if err != nil {
 			log.Fatalf("Error running go list std cmd: %v, %s", err, all)
 		}
@@ -335,7 +405,9 @@ func (t *tester) registerTests() {
 		}
 		if t.race {
 			for _, pkg := range pkgs {
-				t.registerRaceBenchTest(pkg)
+				if t.packageHasBenchmarks(pkg) {
+					t.registerRaceBenchTest(pkg)
+				}
 			}
 		}
 	}
@@ -345,52 +417,106 @@ func (t *tester) registerTests() {
 	}
 
 	// Runtime CPU tests.
-	testName := "runtime:cpu124"
-	t.tests = append(t.tests, distTest{
-		name:    testName,
-		heading: "GOMAXPROCS=2 runtime -cpu=1,2,4",
-		fn: func() error {
-			cmd := t.dirCmd("src", "go", "test", "-short", t.timeout(300), t.tags(), "runtime", "-cpu=1,2,4")
-			// We set GOMAXPROCS=2 in addition to -cpu=1,2,4 in order to test runtime bootstrap code,
-			// creation of first goroutines and first garbage collections in the parallel setting.
-			cmd.Env = mergeEnvLists([]string{"GOMAXPROCS=2"}, os.Environ())
-			return cmd.Run()
-		},
-	})
+	if !t.compileOnly {
+		testName := "runtime:cpu124"
+		t.tests = append(t.tests, distTest{
+			name:    testName,
+			heading: "GOMAXPROCS=2 runtime -cpu=1,2,4",
+			fn: func(dt *distTest) error {
+				cmd := t.addCmd(dt, "src", "go", "test", "-short", t.timeout(300), t.tags(), "runtime", "-cpu=1,2,4")
+				// We set GOMAXPROCS=2 in addition to -cpu=1,2,4 in order to test runtime bootstrap code,
+				// creation of first goroutines and first garbage collections in the parallel setting.
+				cmd.Env = mergeEnvLists([]string{"GOMAXPROCS=2"}, os.Environ())
+				return nil
+			},
+		})
+	}
+
+	// Test that internal linking of standard packages does not
+	// require libgcc. This ensures that we can install a Go
+	// release on a system that does not have a C compiler
+	// installed and still build Go programs (that don't use cgo).
+	for _, pkg := range cgoPackages {
+		if !t.internalLink() {
+			break
+		}
+
+		// ARM libgcc may be Thumb, which internal linking does not support.
+		if t.goarch == "arm" {
+			break
+		}
+
+		pkg := pkg
+		var run string
+		if pkg == "net" {
+			run = "TestTCPStress"
+		}
+		t.tests = append(t.tests, distTest{
+			name:    "nolibgcc:" + pkg,
+			heading: "Testing without libgcc.",
+			fn: func(dt *distTest) error {
+				t.addCmd(dt, "src", "go", "test", "-short", "-ldflags=-linkmode=internal -libgcc=none", t.tags(), pkg, t.runFlag(run))
+				return nil
+			},
+		})
+	}
+
+	// Test internal linking of PIE binaries where it is supported.
+	if t.goos == "linux" && t.goarch == "amd64" {
+		t.tests = append(t.tests, distTest{
+			name:    "pie_internal",
+			heading: "internal linking of -buildmode=pie",
+			fn: func(dt *distTest) error {
+				t.addCmd(dt, "src", "go", "test", "reflect", "-short", "-buildmode=pie", "-ldflags=-linkmode=internal", t.timeout(60), t.tags(), t.runFlag(""))
+				return nil
+			},
+		})
+	}
 
 	// sync tests
 	t.tests = append(t.tests, distTest{
 		name:    "sync_cpu",
 		heading: "sync -cpu=10",
-		fn: func() error {
-			return t.dirCmd("src", "go", "test", "sync", "-short", t.timeout(120), t.tags(), "-cpu=10").Run()
+		fn: func(dt *distTest) error {
+			t.addCmd(dt, "src", "go", "test", "sync", "-short", t.timeout(120), t.tags(), "-cpu=10", t.runFlag(""))
+			return nil
 		},
 	})
 
-	if t.cgoEnabled && t.goos != "android" && !t.iOS() {
-		// Disabled on android and iOS. golang.org/issue/8345
+	if t.cgoEnabled && !t.iOS() {
+		// Disabled on iOS. golang.org/issue/15919
 		t.tests = append(t.tests, distTest{
 			name:    "cgo_stdio",
 			heading: "../misc/cgo/stdio",
-			fn: func() error {
-				return t.dirCmd("misc/cgo/stdio",
-					"go", "run", filepath.Join(os.Getenv("GOROOT"), "test/run.go"), "-", ".").Run()
+			fn: func(dt *distTest) error {
+				t.addCmd(dt, "misc/cgo/stdio", "go", "run", filepath.Join(os.Getenv("GOROOT"), "test/run.go"), "-", ".")
+				return nil
 			},
 		})
 		t.tests = append(t.tests, distTest{
 			name:    "cgo_life",
 			heading: "../misc/cgo/life",
-			fn: func() error {
-				return t.dirCmd("misc/cgo/life",
-					"go", "run", filepath.Join(os.Getenv("GOROOT"), "test/run.go"), "-", ".").Run()
+			fn: func(dt *distTest) error {
+				t.addCmd(dt, "misc/cgo/life", "go", "run", filepath.Join(os.Getenv("GOROOT"), "test/run.go"), "-", ".")
+				return nil
 			},
 		})
+		fortran := os.Getenv("FC")
+		if fortran == "" {
+			fortran, _ = exec.LookPath("gfortran")
+		}
+		if t.hasBash() && fortran != "" {
+			t.tests = append(t.tests, distTest{
+				name:    "cgo_fortran",
+				heading: "../misc/cgo/fortran",
+				fn: func(dt *distTest) error {
+					t.addCmd(dt, "misc/cgo/fortran", "./test.bash", fortran)
+					return nil
+				},
+			})
+		}
 	}
-	if t.cgoEnabled && t.goos != "android" && !t.iOS() {
-		// TODO(crawshaw): reenable on android and iOS
-		// golang.org/issue/8345
-		//
-		// These tests are not designed to run off the host.
+	if t.cgoEnabled {
 		t.tests = append(t.tests, distTest{
 			name:    "cgo_test",
 			heading: "../misc/cgo/test",
@@ -414,20 +540,20 @@ func (t *tester) registerTests() {
 			t.tests = append(t.tests, distTest{
 				name:    "testso",
 				heading: "../misc/cgo/testso",
-				fn: func() error {
-					return t.cgoTestSO("misc/cgo/testso")
+				fn: func(dt *distTest) error {
+					return t.cgoTestSO(dt, "misc/cgo/testso")
 				},
 			})
 			t.tests = append(t.tests, distTest{
 				name:    "testsovar",
 				heading: "../misc/cgo/testsovar",
-				fn: func() error {
-					return t.cgoTestSO("misc/cgo/testsovar")
+				fn: func(dt *distTest) error {
+					return t.cgoTestSO(dt, "misc/cgo/testsovar")
 				},
 			})
 		}
 		if t.supportedBuildmode("c-archive") {
-			t.registerTest("testcarchive", "../misc/cgo/testcarchive", "./test.bash")
+			t.registerHostTest("testcarchive", "../misc/cgo/testcarchive", "misc/cgo/testcarchive", "carchive_test.go")
 		}
 		if t.supportedBuildmode("c-shared") {
 			t.registerTest("testcshared", "../misc/cgo/testcshared", "./test.bash")
@@ -435,8 +561,14 @@ func (t *tester) registerTests() {
 		if t.supportedBuildmode("shared") {
 			t.registerTest("testshared", "../misc/cgo/testshared", "go", "test")
 		}
+		if t.supportedBuildmode("plugin") {
+			t.registerTest("testplugin", "../misc/cgo/testplugin", "./test.bash")
+		}
 		if t.gohostos == "linux" && t.goarch == "amd64" {
 			t.registerTest("testasan", "../misc/cgo/testasan", "go", "run", "main.go")
+		}
+		if t.goos == "linux" && t.goarch == "amd64" {
+			t.registerTest("testsanitizers", "../misc/cgo/testsanitizers", "./test.bash")
 		}
 		if t.hasBash() && t.goos != "android" && !t.iOS() && t.gohostos != "windows" {
 			t.registerTest("cgo_errors", "../misc/cgo/errors", "./test.bash")
@@ -445,14 +577,17 @@ func (t *tester) registerTests() {
 			t.registerTest("testsigfwd", "../misc/cgo/testsigfwd", "go", "run", "main.go")
 		}
 	}
-	if t.hasBash() && t.goos != "nacl" && t.goos != "android" && !t.iOS() {
+
+	// Doc tests only run on builders.
+	// They find problems approximately never.
+	if t.hasBash() && t.goos != "nacl" && t.goos != "android" && !t.iOS() && os.Getenv("GO_BUILDER_NAME") != "" {
 		t.registerTest("doc_progs", "../doc/progs", "time", "go", "run", "run.go")
 		t.registerTest("wiki", "../doc/articles/wiki", "./test.bash")
 		t.registerTest("codewalk", "../doc/codewalk", "time", "./run")
-		t.registerTest("shootout", "../test/bench/shootout", "time", "./timing.sh", "-test")
 	}
+
 	if t.goos != "android" && !t.iOS() {
-		t.registerTest("bench_go1", "../test/bench/go1", "go", "test")
+		t.registerTest("bench_go1", "../test/bench/go1", "go", "test", t.timeout(600), t.runFlag(""))
 	}
 	if t.goos != "android" && !t.iOS() {
 		const nShards = 5
@@ -461,7 +596,7 @@ func (t *tester) registerTests() {
 			t.tests = append(t.tests, distTest{
 				name:    fmt.Sprintf("test:%d_%d", shard, nShards),
 				heading: "../test",
-				fn:      func() error { return t.testDirTest(shard, nShards) },
+				fn:      func(dt *distTest) error { return t.testDirTest(dt, shard, nShards) },
 			})
 		}
 	}
@@ -469,8 +604,13 @@ func (t *tester) registerTests() {
 		t.tests = append(t.tests, distTest{
 			name:    "api",
 			heading: "API check",
-			fn: func() error {
-				return t.dirCmd("src", "go", "run", filepath.Join(t.goroot, "src/cmd/api/run.go")).Run()
+			fn: func(dt *distTest) error {
+				if t.compileOnly {
+					t.addCmd(dt, "src", "go", "build", filepath.Join(t.goroot, "src/cmd/api/run.go"))
+					return nil
+				}
+				t.addCmd(dt, "src", "go", "run", filepath.Join(t.goroot, "src/cmd/api/run.go"))
+				return nil
 			},
 		})
 	}
@@ -487,7 +627,7 @@ func (t *tester) isRegisteredTestName(testName string) bool {
 	return false
 }
 
-func (t *tester) registerTest(name, dirBanner, bin string, args ...string) {
+func (t *tester) registerTest1(seq bool, name, dirBanner, bin string, args ...string) {
 	if bin == "time" && !t.haveTime {
 		bin, args = args[0], args[1:]
 	}
@@ -497,25 +637,52 @@ func (t *tester) registerTest(name, dirBanner, bin string, args ...string) {
 	t.tests = append(t.tests, distTest{
 		name:    name,
 		heading: dirBanner,
-		fn: func() error {
-			return t.dirCmd(filepath.Join(t.goroot, "src", dirBanner), bin, args...).Run()
+		fn: func(dt *distTest) error {
+			if seq {
+				t.runPending(dt)
+				return t.dirCmd(filepath.Join(t.goroot, "src", dirBanner), bin, args...).Run()
+			}
+			t.addCmd(dt, filepath.Join(t.goroot, "src", dirBanner), bin, args...)
+			return nil
 		},
 	})
 }
 
-func (t *tester) dirCmd(dir string, bin string, args ...string) *exec.Cmd {
+func (t *tester) registerTest(name, dirBanner, bin string, args ...string) {
+	t.registerTest1(false, name, dirBanner, bin, args...)
+}
+
+func (t *tester) registerSeqTest(name, dirBanner, bin string, args ...string) {
+	t.registerTest1(true, name, dirBanner, bin, args...)
+}
+
+func (t *tester) bgDirCmd(dir, bin string, args ...string) *exec.Cmd {
 	cmd := exec.Command(bin, args...)
 	if filepath.IsAbs(dir) {
 		cmd.Dir = dir
 	} else {
 		cmd.Dir = filepath.Join(t.goroot, dir)
 	}
+	return cmd
+}
+
+func (t *tester) dirCmd(dir, bin string, args ...string) *exec.Cmd {
+	cmd := t.bgDirCmd(dir, bin, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if vflag > 1 {
 		errprintf("%s\n", strings.Join(cmd.Args, " "))
 	}
 	return cmd
+}
+
+func (t *tester) addCmd(dt *distTest, dir, bin string, args ...string) *exec.Cmd {
+	w := &work{
+		dt:  dt,
+		cmd: t.bgDirCmd(dir, bin, args...),
+	}
+	t.worklist = append(t.worklist, w)
+	return w.cmd
 }
 
 func (t *tester) iOS() bool {
@@ -536,7 +703,7 @@ func (t *tester) extLink() bool {
 		"darwin-arm", "darwin-arm64",
 		"dragonfly-386", "dragonfly-amd64",
 		"freebsd-386", "freebsd-amd64", "freebsd-arm",
-		"linux-386", "linux-amd64", "linux-arm", "linux-arm64",
+		"linux-386", "linux-amd64", "linux-arm", "linux-arm64", "linux-ppc64le", "linux-mips64", "linux-mips64le", "linux-mips", "linux-mipsle", "linux-s390x",
 		"netbsd-386", "netbsd-amd64",
 		"openbsd-386", "openbsd-amd64",
 		"windows-386", "windows-amd64":
@@ -554,6 +721,31 @@ func (t *tester) extLink() bool {
 	return false
 }
 
+func (t *tester) internalLink() bool {
+	if t.gohostos == "dragonfly" {
+		// linkmode=internal fails on dragonfly since errno is a TLS relocation.
+		return false
+	}
+	if t.gohostarch == "ppc64le" {
+		// linkmode=internal fails on ppc64le because cmd/link doesn't
+		// handle the TOC correctly (issue 15409).
+		return false
+	}
+	if t.goos == "android" {
+		return false
+	}
+	if t.goos == "darwin" && (t.goarch == "arm" || t.goarch == "arm64") {
+		return false
+	}
+	// Internally linking cgo is incomplete on some architectures.
+	// https://golang.org/issue/10373
+	// https://golang.org/issue/14449
+	if t.goarch == "arm64" || t.goarch == "mips64" || t.goarch == "mips64le" || t.goarch == "mips" || t.goarch == "mipsle" {
+		return false
+	}
+	return true
+}
+
 func (t *tester) supportedBuildmode(mode string) bool {
 	pair := t.goos + "-" + t.goarch
 	switch mode {
@@ -562,52 +754,78 @@ func (t *tester) supportedBuildmode(mode string) bool {
 			return false
 		}
 		switch pair {
-		case "darwin-amd64", "darwin-arm", "darwin-arm64",
-			"linux-amd64", "linux-386":
+		case "darwin-386", "darwin-amd64", "darwin-arm", "darwin-arm64",
+			"linux-amd64", "linux-386", "windows-amd64", "windows-386":
 			return true
 		}
 		return false
 	case "c-shared":
-		// TODO(hyangah): add linux-386.
 		switch pair {
-		case "linux-amd64", "darwin-amd64", "android-arm":
+		case "linux-386", "linux-amd64", "linux-arm", "linux-arm64",
+			"darwin-amd64", "darwin-386",
+			"android-arm", "android-arm64", "android-386":
 			return true
 		}
 		return false
 	case "shared":
 		switch pair {
-		case "linux-amd64":
+		case "linux-386", "linux-amd64", "linux-arm", "linux-arm64", "linux-ppc64le", "linux-s390x":
+			return true
+		}
+		return false
+	case "plugin":
+		if os.Getenv("GO_BUILDER_NAME") == "linux-amd64-noopt" {
+			// Skip the plugin tests on noopt. They're
+			// causing build failures potentially
+			// obscuring other issues. This is hopefully a
+			// temporary workaround. See golang.org/issue/17937.
+			return false
+		}
+
+		// linux-arm64 is missing because it causes the external linker
+		// to crash, see https://golang.org/issue/17138
+		switch pair {
+		case "linux-386", "linux-amd64", "linux-arm":
 			return true
 		}
 		return false
 	default:
-		log.Fatal("internal error: unknown buildmode %s", mode)
+		log.Fatalf("internal error: unknown buildmode %s", mode)
 		return false
 	}
 }
 
-func (t *tester) cgoTest() error {
-	env := mergeEnvLists([]string{"GOTRACEBACK=2"}, os.Environ())
+func (t *tester) registerHostTest(name, heading, dir, pkg string) {
+	t.tests = append(t.tests, distTest{
+		name:    name,
+		heading: heading,
+		fn: func(dt *distTest) error {
+			t.runPending(dt)
+			return t.runHostTest(dir, pkg)
+		},
+	})
+}
 
-	if t.goos == "android" || t.iOS() {
-		cmd := t.dirCmd("misc/cgo/test", "go", "test", t.tags())
-		cmd.Env = env
-		return cmd.Run()
-	}
-
-	cmd := t.dirCmd("misc/cgo/test", "go", "test", t.tags(), "-ldflags", "-linkmode=auto")
+func (t *tester) runHostTest(dir, pkg string) error {
+	env := mergeEnvLists([]string{"GOARCH=" + t.gohostarch, "GOOS=" + t.gohostos}, os.Environ())
+	defer os.Remove(filepath.Join(t.goroot, dir, "test.test"))
+	cmd := t.dirCmd(dir, "go", "test", t.tags(), "-c", "-o", "test.test", pkg)
 	cmd.Env = env
 	if err := cmd.Run(); err != nil {
 		return err
 	}
+	return t.dirCmd(dir, "./test.test").Run()
+}
 
-	if t.gohostos != "dragonfly" {
-		// linkmode=internal fails on dragonfly since errno is a TLS relocation.
-		cmd := t.dirCmd("misc/cgo/test", "go", "test", "-ldflags", "-linkmode=internal")
+func (t *tester) cgoTest(dt *distTest) error {
+	env := mergeEnvLists([]string{"GOTRACEBACK=2"}, os.Environ())
+
+	cmd := t.addCmd(dt, "misc/cgo/test", "go", "test", t.tags(), "-ldflags", "-linkmode=auto", t.runFlag(""))
+	cmd.Env = env
+
+	if t.internalLink() {
+		cmd := t.addCmd(dt, "misc/cgo/test", "go", "test", "-ldflags", "-linkmode=internal", t.runFlag(""))
 		cmd.Env = env
-		if err := cmd.Run(); err != nil {
-			return err
-		}
 	}
 
 	pair := t.gohostos + "-" + t.goarch
@@ -619,37 +837,24 @@ func (t *tester) cgoTest() error {
 		if !t.extLink() {
 			break
 		}
-		cmd := t.dirCmd("misc/cgo/test", "go", "test", "-ldflags", "-linkmode=external")
+		cmd := t.addCmd(dt, "misc/cgo/test", "go", "test", "-ldflags", "-linkmode=external")
 		cmd.Env = env
-		if err := cmd.Run(); err != nil {
-			return err
-		}
-		cmd = t.dirCmd("misc/cgo/test", "go", "test", "-ldflags", "-linkmode=external -s")
+		cmd = t.addCmd(dt, "misc/cgo/test", "go", "test", "-ldflags", "-linkmode=external -s")
 		cmd.Env = env
-		if err := cmd.Run(); err != nil {
-			return err
-		}
 	case "android-arm",
 		"dragonfly-386", "dragonfly-amd64",
 		"freebsd-386", "freebsd-amd64", "freebsd-arm",
-		"linux-386", "linux-amd64", "linux-arm",
+		"linux-386", "linux-amd64", "linux-arm", "linux-ppc64le", "linux-s390x",
 		"netbsd-386", "netbsd-amd64":
 
-		cmd := t.dirCmd("misc/cgo/test", "go", "test", "-ldflags", "-linkmode=external")
+		cmd := t.addCmd(dt, "misc/cgo/test", "go", "test", "-ldflags", "-linkmode=external")
 		cmd.Env = env
-		if err := cmd.Run(); err != nil {
-			return err
-		}
-		cmd = t.dirCmd("misc/cgo/testtls", "go", "test", "-ldflags", "-linkmode=auto")
+
+		cmd = t.addCmd(dt, "misc/cgo/testtls", "go", "test", "-ldflags", "-linkmode=auto")
 		cmd.Env = env
-		if err := cmd.Run(); err != nil {
-			return err
-		}
-		cmd = t.dirCmd("misc/cgo/testtls", "go", "test", "-ldflags", "-linkmode=external")
+
+		cmd = t.addCmd(dt, "misc/cgo/testtls", "go", "test", "-ldflags", "-linkmode=external")
 		cmd.Env = env
-		if err := cmd.Run(); err != nil {
-			return err
-		}
 
 		switch pair {
 		case "netbsd-386", "netbsd-amd64":
@@ -669,28 +874,20 @@ func (t *tester) cgoTest() error {
 			if err := cmd.Run(); err != nil {
 				fmt.Println("No support for static linking found (lacks libc.a?), skip cgo static linking test.")
 			} else {
-				cmd = t.dirCmd("misc/cgo/testtls", "go", "test", "-ldflags", `-linkmode=external -extldflags "-static -pthread"`)
-				cmd.Env = env
-				if err := cmd.Run(); err != nil {
-					return err
+				if t.goos != "android" {
+					cmd = t.addCmd(dt, "misc/cgo/testtls", "go", "test", "-ldflags", `-linkmode=external -extldflags "-static -pthread"`)
+					cmd.Env = env
 				}
 
-				cmd = t.dirCmd("misc/cgo/nocgo", "go", "test")
+				cmd = t.addCmd(dt, "misc/cgo/nocgo", "go", "test")
 				cmd.Env = env
-				if err := cmd.Run(); err != nil {
-					return err
-				}
 
-				cmd = t.dirCmd("misc/cgo/nocgo", "go", "test", "-ldflags", `-linkmode=external`)
+				cmd = t.addCmd(dt, "misc/cgo/nocgo", "go", "test", "-ldflags", `-linkmode=external`)
 				cmd.Env = env
-				if err := cmd.Run(); err != nil {
-					return err
-				}
 
-				cmd = t.dirCmd("misc/cgo/nocgo", "go", "test", "-ldflags", `-linkmode=external -extldflags "-static -pthread"`)
-				cmd.Env = env
-				if err := cmd.Run(); err != nil {
-					return err
+				if t.goos != "android" {
+					cmd = t.addCmd(dt, "misc/cgo/nocgo", "go", "test", "-ldflags", `-linkmode=external -extldflags "-static -pthread"`)
+					cmd.Env = env
 				}
 			}
 
@@ -702,21 +899,15 @@ func (t *tester) cgoTest() error {
 				if err := cmd.Run(); err != nil {
 					fmt.Println("No support for -pie found, skip cgo PIE test.")
 				} else {
-					cmd = t.dirCmd("misc/cgo/test", "go", "test", "-ldflags", `-linkmode=external -extldflags "-pie"`)
+					cmd = t.addCmd(dt, "misc/cgo/test", "go", "test", "-ldflags", `-linkmode=external -extldflags "-pie"`)
 					cmd.Env = env
-					if err := cmd.Run(); err != nil {
-						return fmt.Errorf("pie cgo/test: %v", err)
-					}
-					cmd = t.dirCmd("misc/cgo/testtls", "go", "test", "-ldflags", `-linkmode=external -extldflags "-pie"`)
+
+					cmd = t.addCmd(dt, "misc/cgo/testtls", "go", "test", "-ldflags", `-linkmode=external -extldflags "-pie"`)
 					cmd.Env = env
-					if err := cmd.Run(); err != nil {
-						return fmt.Errorf("pie cgo/testtls: %v", err)
-					}
-					cmd = t.dirCmd("misc/cgo/nocgo", "go", "test", "-ldflags", `-linkmode=external -extldflags "-pie"`)
+
+					cmd = t.addCmd(dt, "misc/cgo/nocgo", "go", "test", "-ldflags", `-linkmode=external -extldflags "-pie"`)
 					cmd.Env = env
-					if err := cmd.Run(); err != nil {
-						return fmt.Errorf("pie cgo/nocgo: %v", err)
-					}
+
 				}
 			}
 		}
@@ -725,19 +916,97 @@ func (t *tester) cgoTest() error {
 	return nil
 }
 
+// run pending test commands, in parallel, emitting headers as appropriate.
+// When finished, emit header for nextTest, which is going to run after the
+// pending commands are done (and runPending returns).
+// A test should call runPending if it wants to make sure that it is not
+// running in parallel with earlier tests, or if it has some other reason
+// for needing the earlier tests to be done.
+func (t *tester) runPending(nextTest *distTest) {
+	worklist := t.worklist
+	t.worklist = nil
+	for _, w := range worklist {
+		w.start = make(chan bool)
+		w.end = make(chan bool)
+		go func(w *work) {
+			if !<-w.start {
+				w.out = []byte(fmt.Sprintf("skipped due to earlier error\n"))
+			} else {
+				w.out, w.err = w.cmd.CombinedOutput()
+			}
+			w.end <- true
+		}(w)
+	}
+
+	started := 0
+	ended := 0
+	var last *distTest
+	for ended < len(worklist) {
+		for started < len(worklist) && started-ended < maxbg {
+			//println("start", started)
+			w := worklist[started]
+			started++
+			w.start <- !t.failed || t.keepGoing
+		}
+		w := worklist[ended]
+		dt := w.dt
+		if dt.heading != "" && t.lastHeading != dt.heading {
+			t.lastHeading = dt.heading
+			t.out(dt.heading)
+		}
+		if dt != last {
+			// Assumes all the entries for a single dt are in one worklist.
+			last = w.dt
+			if vflag > 0 {
+				fmt.Printf("# go tool dist test -run=^%s$\n", dt.name)
+			}
+		}
+		if vflag > 1 {
+			errprintf("%s\n", strings.Join(w.cmd.Args, " "))
+		}
+		//println("wait", ended)
+		ended++
+		<-w.end
+		os.Stdout.Write(w.out)
+		if w.err != nil {
+			log.Printf("Failed: %v", w.err)
+			t.failed = true
+		}
+	}
+	if t.failed && !t.keepGoing {
+		log.Fatal("FAILED")
+	}
+
+	if dt := nextTest; dt != nil {
+		if dt.heading != "" && t.lastHeading != dt.heading {
+			t.lastHeading = dt.heading
+			t.out(dt.heading)
+		}
+		if vflag > 0 {
+			fmt.Printf("# go tool dist test -run=^%s$\n", dt.name)
+		}
+	}
+}
+
 func (t *tester) cgoTestSOSupported() bool {
 	if t.goos == "android" || t.iOS() {
 		// No exec facility on Android or iOS.
 		return false
 	}
-	if t.goarch == "ppc64le" || t.goarch == "ppc64" {
+	if t.goarch == "ppc64" {
 		// External linking not implemented on ppc64 (issue #8912).
+		return false
+	}
+	if t.goarch == "mips64le" || t.goarch == "mips64" {
+		// External linking not implemented on mips64.
 		return false
 	}
 	return true
 }
 
-func (t *tester) cgoTestSO(testpath string) error {
+func (t *tester) cgoTestSO(dt *distTest, testpath string) error {
+	t.runPending(dt)
+
 	dir := filepath.Join(t.goroot, testpath)
 
 	// build shared object
@@ -785,6 +1054,12 @@ func (t *tester) cgoTestSO(testpath string) error {
 			s = "DYLD_LIBRARY_PATH"
 		}
 		cmd.Env = mergeEnvLists([]string{s + "=."}, os.Environ())
+
+		// On FreeBSD 64-bit architectures, the 32-bit linker looks for
+		// different environment variables.
+		if t.goos == "freebsd" && t.gohostarch == "386" {
+			cmd.Env = mergeEnvLists([]string{"LD_32_LIBRARY_PATH=."}, cmd.Env)
+		}
 	}
 	return cmd.Run()
 }
@@ -805,46 +1080,65 @@ func (t *tester) raceDetectorSupported() bool {
 	return false
 }
 
-func (t *tester) raceTest() error {
-	if err := t.dirCmd("src", "go", "test", "-race", "-i", "runtime/race", "flag", "os/exec").Run(); err != nil {
-		return err
+func (t *tester) runFlag(rx string) string {
+	if t.compileOnly {
+		return "-run=^$"
 	}
-	if err := t.dirCmd("src", "go", "test", "-race", "-run=Output", "runtime/race").Run(); err != nil {
-		return err
-	}
-	if err := t.dirCmd("src", "go", "test", "-race", "-short", "flag", "os/exec").Run(); err != nil {
-		return err
-	}
+	return "-run=" + rx
+}
+
+func (t *tester) raceTest(dt *distTest) error {
+	t.addCmd(dt, "src", "go", "test", "-race", "-i", "runtime/race", "flag", "os/exec")
+	t.addCmd(dt, "src", "go", "test", "-race", t.runFlag("Output"), "runtime/race")
+	t.addCmd(dt, "src", "go", "test", "-race", "-short", t.runFlag("TestParse|TestEcho|TestStdinCloseRace"), "flag", "os/exec")
+	// We don't want the following line, because it
+	// slows down all.bash (by 10 seconds on my laptop).
+	// The race builder should catch any error here, but doesn't.
+	// TODO(iant): Figure out how to catch this.
+	// t.addCmd(dt, "src", "go", "test", "-race", "-run=TestParallelTest", "cmd/go")
 	if t.cgoEnabled {
 		env := mergeEnvLists([]string{"GOTRACEBACK=2"}, os.Environ())
-		cmd := t.dirCmd("misc/cgo/test", "go", "test", "-race", "-short")
+		cmd := t.addCmd(dt, "misc/cgo/test", "go", "test", "-race", "-short", t.runFlag(""))
 		cmd.Env = env
-		if err := cmd.Run(); err != nil {
-			return err
-		}
 	}
 	if t.extLink() {
 		// Test with external linking; see issue 9133.
-		if err := t.dirCmd("src", "go", "test", "-race", "-short", "-ldflags=-linkmode=external", "flag", "os/exec").Run(); err != nil {
-			return err
-		}
+		t.addCmd(dt, "src", "go", "test", "-race", "-short", "-ldflags=-linkmode=external", t.runFlag("TestParse|TestEcho|TestStdinCloseRace"), "flag", "os/exec")
 	}
 	return nil
 }
 
-func (t *tester) testDirTest(shard, shards int) error {
-	const runExe = "runtest.exe" // named exe for Windows, but harmless elsewhere
-	cmd := t.dirCmd("test", "go", "build", "-o", runExe, "run.go")
-	cmd.Env = mergeEnvLists([]string{"GOOS=" + t.gohostos, "GOARCH=" + t.gohostarch, "GOMAXPROCS="}, os.Environ())
-	if err := cmd.Run(); err != nil {
-		return err
+var runtest struct {
+	sync.Once
+	exe string
+	err error
+}
+
+func (t *tester) testDirTest(dt *distTest, shard, shards int) error {
+	runtest.Do(func() {
+		const exe = "runtest.exe" // named exe for Windows, but harmless elsewhere
+		cmd := t.dirCmd("test", "go", "build", "-o", exe, "run.go")
+		cmd.Env = mergeEnvLists([]string{"GOOS=" + t.gohostos, "GOARCH=" + t.gohostarch, "GOMAXPROCS="}, os.Environ())
+		runtest.exe = filepath.Join(cmd.Dir, exe)
+		if err := cmd.Run(); err != nil {
+			runtest.err = err
+			return
+		}
+		xatexit(func() {
+			os.Remove(runtest.exe)
+		})
+	})
+	if runtest.err != nil {
+		return runtest.err
 	}
-	absExe := filepath.Join(cmd.Dir, runExe)
-	defer os.Remove(absExe)
-	return t.dirCmd("test", absExe,
+	if t.compileOnly {
+		return nil
+	}
+	t.addCmd(dt, "test", runtest.exe,
 		fmt.Sprintf("--shard=%d", shard),
 		fmt.Sprintf("--shards=%d", shards),
-	).Run()
+	)
+	return nil
 }
 
 // mergeEnvLists merges the two environment lists such that
@@ -863,4 +1157,46 @@ NextVar:
 		out = append(out, inkv)
 	}
 	return out
+}
+
+// cgoPackages is the standard packages that use cgo.
+var cgoPackages = []string{
+	"crypto/x509",
+	"net",
+	"os/user",
+}
+
+var funcBenchmark = []byte("\nfunc Benchmark")
+
+// packageHasBenchmarks reports whether pkg has benchmarks.
+// On any error, it conservatively returns true.
+//
+// This exists just to eliminate work on the builders, since compiling
+// a test in race mode just to discover it has no benchmarks costs a
+// second or two per package, and this function returns false for
+// about 100 packages.
+func (t *tester) packageHasBenchmarks(pkg string) bool {
+	pkgDir := filepath.Join(t.goroot, "src", pkg)
+	d, err := os.Open(pkgDir)
+	if err != nil {
+		return true // conservatively
+	}
+	defer d.Close()
+	names, err := d.Readdirnames(-1)
+	if err != nil {
+		return true // conservatively
+	}
+	for _, name := range names {
+		if !strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		slurp, err := ioutil.ReadFile(filepath.Join(pkgDir, name))
+		if err != nil {
+			return true // conservatively
+		}
+		if bytes.Contains(slurp, funcBenchmark) {
+			return true
+		}
+	}
+	return false
 }

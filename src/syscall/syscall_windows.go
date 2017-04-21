@@ -1,4 +1,4 @@
-// Copyright 2009 The Go Authors.  All rights reserved.
+// Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -8,12 +8,11 @@ package syscall
 
 import (
 	errorspkg "errors"
+	"internal/race"
 	"sync"
 	"unicode/utf16"
 	"unsafe"
 )
-
-//go:generate go run mksyscall_windows.go -output zsyscall_windows.go syscall_windows.go security_windows.go
 
 type Handle uintptr
 
@@ -74,8 +73,6 @@ func UTF16PtrFromString(s string) (*uint16, error) {
 	}
 	return &a[0], nil
 }
-
-func Getpagesize() int { return 4096 }
 
 // Errno is the Windows error number.
 type Errno uintptr
@@ -304,26 +301,32 @@ func Read(fd Handle, p []byte) (n int, err error) {
 		}
 		return 0, e
 	}
-	if raceenabled {
+	if race.Enabled {
 		if done > 0 {
-			raceWriteRange(unsafe.Pointer(&p[0]), int(done))
+			race.WriteRange(unsafe.Pointer(&p[0]), int(done))
 		}
-		raceAcquire(unsafe.Pointer(&ioSync))
+		race.Acquire(unsafe.Pointer(&ioSync))
+	}
+	if msanenabled && done > 0 {
+		msanWrite(unsafe.Pointer(&p[0]), int(done))
 	}
 	return int(done), nil
 }
 
 func Write(fd Handle, p []byte) (n int, err error) {
-	if raceenabled {
-		raceReleaseMerge(unsafe.Pointer(&ioSync))
+	if race.Enabled {
+		race.ReleaseMerge(unsafe.Pointer(&ioSync))
 	}
 	var done uint32
 	e := WriteFile(fd, p, &done, nil)
 	if e != nil {
 		return 0, e
 	}
-	if raceenabled && done > 0 {
-		raceReadRange(unsafe.Pointer(&p[0]), int(done))
+	if race.Enabled && done > 0 {
+		race.ReadRange(unsafe.Pointer(&p[0]), int(done))
+	}
+	if msanenabled && done > 0 {
+		msanRead(unsafe.Pointer(&p[0]), int(done))
 	}
 	return int(done), nil
 }
@@ -1021,11 +1024,31 @@ func Readlink(path string, buf []byte) (n int, err error) {
 	case IO_REPARSE_TAG_SYMLINK:
 		data := (*symbolicLinkReparseBuffer)(unsafe.Pointer(&rdb.reparseBuffer))
 		p := (*[0xffff]uint16)(unsafe.Pointer(&data.PathBuffer[0]))
-		s = UTF16ToString(p[data.PrintNameOffset/2 : (data.PrintNameLength-data.PrintNameOffset)/2])
+		s = UTF16ToString(p[data.SubstituteNameOffset/2 : (data.SubstituteNameOffset+data.SubstituteNameLength)/2])
+		if data.Flags&_SYMLINK_FLAG_RELATIVE == 0 {
+			if len(s) >= 4 && s[:4] == `\??\` {
+				s = s[4:]
+				switch {
+				case len(s) >= 2 && s[1] == ':': // \??\C:\foo\bar
+					// do nothing
+				case len(s) >= 4 && s[:4] == `UNC\`: // \??\UNC\foo\bar
+					s = `\\` + s[4:]
+				default:
+					// unexpected; do nothing
+				}
+			} else {
+				// unexpected; do nothing
+			}
+		}
 	case _IO_REPARSE_TAG_MOUNT_POINT:
 		data := (*mountPointReparseBuffer)(unsafe.Pointer(&rdb.reparseBuffer))
 		p := (*[0xffff]uint16)(unsafe.Pointer(&data.PathBuffer[0]))
-		s = UTF16ToString(p[data.PrintNameOffset/2 : (data.PrintNameLength-data.PrintNameOffset)/2])
+		s = UTF16ToString(p[data.SubstituteNameOffset/2 : (data.SubstituteNameOffset+data.SubstituteNameLength)/2])
+		if len(s) >= 4 && s[:4] == `\??\` { // \??\C:\foo\bar
+			s = s[4:]
+		} else {
+			// unexpected; do nothing
+		}
 	default:
 		// the path is not a symlink or junction but another type of reparse
 		// point
